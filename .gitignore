@@ -1,0 +1,10 @@
+backend/venv/
+backend/__pycache__/
+backend/temp_*.wav
+backend/temp_*.mp3
+backend/temp_*.m4a
+backend/temp_*.mpeg
+backend/results/
+Fortend/node_modules/
+Fortend/build/
+Fortend/.next/
