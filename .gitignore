@@ -1,19 +1,58 @@
-# Python
+# ======================
+# 🔹 Python (Backend)
+# ======================
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 *.db
+*.sqlite3
 
-# Env
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Environment variables
 .env
+.env.local
 
 # Backend temp files
 backend/temp_*
 backend/results/
 
-# Frontend
+# ======================
+# 🔹 Node / Frontend
+# ======================
+node_modules/
 frontend/node_modules/
-frontend/build/
-frontend/.next/
 
-# General
+# Build files
+dist/
+build/
+frontend/dist/
+frontend/build/
+
+# Next.js / Vite cache
+.next/
+.vite/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ======================
+# 🔹 OS & Editor files
+# ======================
 .DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# ======================
+# 🔹 Misc
+# ======================
+*.log
+*.tmp
