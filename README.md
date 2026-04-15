@@ -39,3 +39,9 @@ cd backend
 python -m venv venv
 .\venv\Scripts\activate
 pip install -r ..\requirements.txt
+ python server.py
+
+
+### frontend
+ cd frontend
+npm run dev  
