@@ -10,6 +10,16 @@ from datetime import datetime
 import openpyxl
 import requests
 
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None
+
+# OLLAMA CONFIG
+OLLAMA_API_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
+OLLAMA_TIMEOUT = 900
+
 # -----------------------------------------
 # CONFIG
 # -----------------------------------------
@@ -21,79 +31,34 @@ CONVERTED_EXCEL_FILE = os.path.join(RESULTS_DIR, "converted_calls.xlsx")
 SALES_CRM_FILE = os.path.join(RESULTS_DIR, "sales_crm.xlsx")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-_GEMINI_IMPORT_ERROR_LOGGED = False
-_GEMINI_DISABLED_REASON = None
 
+_WHISPER_MODEL_INSTANCE = None
 
-def _bootstrap_local_venv_site_packages():
-    """
-    If the backend is started with a global Python interpreter, allow imports from the
-    bundled backend virtualenv so optional SDKs like Gemini still resolve.
-    """
-    py_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    candidate_paths = [
-        os.path.join(BASE_DIR, "venv", "Lib", "site-packages"),
-        os.path.join(BASE_DIR, "venv", "lib", py_version, "site-packages"),
-    ]
+def get_whisper_model():
+    global _WHISPER_MODEL_INSTANCE
+    if _WHISPER_MODEL_INSTANCE is None:
+        if WhisperModel is None:
+            raise ImportError("faster-whisper is not installed. Please install it using 'pip install faster-whisper'.")
+        print("Loading local Faster-Whisper base model... this may take a few seconds on first run.")
+        _WHISPER_MODEL_INSTANCE = WhisperModel("base", device="cpu", compute_type="int8")
+    return _WHISPER_MODEL_INSTANCE
 
-    for path in candidate_paths:
-        if os.path.isdir(path) and path not in sys.path:
-            sys.path.insert(0, path)
-
-
-def _import_gemini_sdk(log_context):
-    global _GEMINI_IMPORT_ERROR_LOGGED
-
-    _bootstrap_local_venv_site_packages()
-
-    try:
-        import google.generativeai as genai
-        return genai
-    except Exception as e:
-        if not _GEMINI_IMPORT_ERROR_LOGGED:
-            print(
-                f"Gemini disabled ({log_context}): {e}. "
-                "Start the backend with backend\\venv\\Scripts\\python.exe or install "
-                "requirements from voice-ai\\requirements.txt."
-            )
-            _GEMINI_IMPORT_ERROR_LOGGED = True
-        return None
-
-
-def _import_google_genai_sdk(log_context):
-    _bootstrap_local_venv_site_packages()
-
-    try:
-        from google import genai
-        return genai
-    except Exception as e:
-        print(f"Google GenAI SDK unavailable for {log_context}: {e}")
-        return None
-
-
-def _get_gemini_api_key():
-    global _GEMINI_DISABLED_REASON
-
-    api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
-    if not api_key:
-        return ""
-
-    invalid_markers = {
-        "placeholder_api_key",
-        "your_api_key",
-        "your_gemini_api_key",
-        "changeme",
+def ollama_generate(prompt, enforce_json=False):
+    data = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
     }
-    if api_key.lower() in invalid_markers:
-        if _GEMINI_DISABLED_REASON != "placeholder":
-            print("Gemini disabled: GEMINI_API_KEY is still set to a placeholder value.")
-            _GEMINI_DISABLED_REASON = "placeholder"
-        return ""
+    if enforce_json:
+        data["format"] = "json"
 
-    if _GEMINI_DISABLED_REASON == "invalid_key":
+    try:
+        response = requests.post(OLLAMA_API_URL, json=data, timeout=OLLAMA_TIMEOUT)
+        response.raise_for_status()
+        return response.json().get("response", "")
+    except Exception as e:
+        print(f"Ollama generation failed: {e}. Is Ollama running on {OLLAMA_API_URL}?")
         return ""
-
-    return api_key
 
 
 # -----------------------------------------
@@ -336,128 +301,58 @@ def transcribe_file_elevenlabs(filepath):
             pass
 
 
-def transcribe_file_gemini(filepath):
-    global _GEMINI_DISABLED_REASON
-
-    api_key = _get_gemini_api_key()
-    if not api_key:
-        return ""
-
-    genai = _import_google_genai_sdk("audio transcription")
-    if genai is None:
-        return ""
-
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-    mime_type = mimetypes.guess_type(filepath)[0] or "application/octet-stream"
-    prompt = """
-Generate a verbatim transcript of the speech in this audio.
-
-Rules:
-- Return only the transcript text.
-- Do not summarize.
-- Do not add speaker labels unless they are obvious from the audio.
-- Do not include markdown or explanations.
-- Remove obvious non-speech promo or outro lines if they are unrelated to the call content.
-""".strip()
-
-    client = None
-    uploaded_file = None
+def transcribe_file_local(filepath):
     try:
-        client = genai.Client(api_key=api_key)
-        uploaded_file = client.files.upload(file=filepath)
-        response = client.models.generate_content(
-            model=model_name,
-            contents=[prompt, uploaded_file],
-        )
-        text = getattr(response, "text", "") or ""
+        model = get_whisper_model()
+        segments, info = model.transcribe(filepath, beam_size=5)
+        text = " ".join([segment.text for segment in segments])
         return _format_transcript_for_display(text)
     except Exception as e:
-        error_text = str(e)
-        if "API_KEY_INVALID" in error_text or "API key not valid" in error_text:
-            if _GEMINI_DISABLED_REASON != "invalid_key":
-                print("Gemini disabled: GEMINI_API_KEY was rejected by the API.")
-                _GEMINI_DISABLED_REASON = "invalid_key"
-            return ""
-        print("Gemini audio transcription failed:", e)
-        return ""
-    finally:
-        if client is not None and uploaded_file is not None:
-            try:
-                client.files.delete(name=uploaded_file.name)
-            except Exception:
-                pass
-
-
-def gemini_refine_transcript(raw_transcript, alt_transcript=""):
-    """
-    Cleans ASR output while preserving meaning and factual content.
-    """
-    global _GEMINI_DISABLED_REASON
-
-    api_key = _get_gemini_api_key()
-    if not api_key:
+        print("Local audio transcription failed:", e)
         return ""
 
+
+def local_refine_transcript(raw_transcript, alt_transcript=""):
+    """
+    Cleans ASR output using local Ollama model.
+    """
     raw_transcript = _format_transcript_for_display(raw_transcript)
-    alt_transcript = _format_transcript_for_display(alt_transcript)
     if not raw_transcript:
         return ""
 
-    genai = _import_gemini_sdk("transcript refinement")
-    if genai is None:
-        return ""
-
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     prompt = f"""
-You are an ASR cleanup engine.
+You are a highly accurate ASR cleanup engine.
 Return ONLY valid JSON:
 {{
   "refined_transcript": "string"
 }}
 
 Rules:
-- Do NOT add new facts.
-- Preserve original meaning exactly.
-- Fix punctuation, spacing, obvious ASR spelling errors.
+- Do NOT add new facts. Preserve the original meaning exactly.
+- Fix punctuation, spacing, grammar, and obvious ASR spelling errors to make it highly professional.
 - Keep Hinglish/code-mixed words when present.
-- If uncertain, keep original wording.
-- Remove obvious promo/outro junk unrelated to the actual call.
-- Break long text into readable paragraphs.
-- If the transcript clearly alternates between agent and customer, preserve those turns on separate lines.
-- Do not summarize. Return the cleaned transcript only.
+- Eliminate obvious promo/outro junk unrelated to the actual call.
+- Explicitly format the text as a clear two-way conversation. Every turn must start with a speaker label ("Agent:" or "Customer:") on a new line. Infer the speaker from context if missing.
+- Do not summarize. Return only the cleaned, well-formatted transcript capturing the accurate dialogue.
 
 Primary transcript:
 {raw_transcript}
-
-Secondary transcript (optional):
-{alt_transcript}
 """
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(model_name)
-        response = model.generate_content(
-            prompt,
-            generation_config={"temperature": 0.1, "max_output_tokens": 1200},
-        )
-        parsed = _extract_json_object(getattr(response, "text", "") or "")
+        response_text = ollama_generate(prompt, enforce_json=True)
+        parsed = _extract_json_object(response_text)
         if not parsed:
             return ""
         return _format_transcript_for_display(parsed.get("refined_transcript", ""))
     except Exception as e:
-        error_text = str(e)
-        if "API_KEY_INVALID" in error_text or "API key not valid" in error_text:
-            if _GEMINI_DISABLED_REASON != "invalid_key":
-                print("Gemini disabled: GEMINI_API_KEY was rejected by the API.")
-                _GEMINI_DISABLED_REASON = "invalid_key"
-            return ""
-        print("Gemini transcript refinement failed:", e)
+        print("Local transcript refinement failed:", e)
         return ""
 
 
 def transcribe_file(filepath):
-    # Use Gemini transcription only.
-    gemini_text = transcribe_file_gemini(filepath)
-    base_text = _normalize_whitespace(gemini_text)
+    # Use Local transcription only.
+    local_text = transcribe_file_local(filepath)
+    base_text = _normalize_whitespace(local_text)
     if not base_text:
         return ""
 
@@ -472,7 +367,7 @@ def transcribe_file(filepath):
         should_refine = False
 
     if should_refine:
-        refined = gemini_refine_transcript(base_text, "")
+        refined = local_refine_transcript(base_text, "")
         if refined:
             return refined
 
@@ -575,18 +470,10 @@ def _normalize_sentiment_label(value):
     return "neutral"
 
 
-def gemini_summary(transcript):
-    global _GEMINI_DISABLED_REASON
-
-    api_key = _get_gemini_api_key()
-    if not api_key or not transcript.strip():
+def local_summary(transcript):
+    if not transcript.strip():
         return ""
 
-    genai = _import_gemini_sdk("summary")
-    if genai is None:
-        return ""
-
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     prompt = f"""
 You are an expert call summarization engine.
 Return ONLY valid JSON:
@@ -595,38 +482,27 @@ Return ONLY valid JSON:
 }}
 
 Rules:
-- Provide a cohesive, well-structured paragraph (4-6 sentences) summarizing the entire call.
-- In the summary, specify the reason for the call, key discussions, problems faced, the agent's resolution, and next steps or outcome.
-- Use a natural, professional writing style without using rigid section headings like "Call Purpose:" or "Final Outcome:".
+- Provide a highly accurate, professional summary of the entire call.
+- Format the summary to reflect a two-way conversation narrative (e.g., detailing the back-and-forth flow: what the Customer stated/requested vs. how the Agent responded/resolved it).
+- Ensure it reads like a professional interaction report, capturing the core issue, key dialogue exchange, and the final resolution or next steps.
 - Focus purely on factual conversational details from the transcript.
-- Ignore generic promotional script lines and automated messages unless directly relevant to the conversation.
+- Ignore generic promotional script lines and automated messages.
 
 Transcript:
 {transcript}
 """
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(model_name)
-        response = model.generate_content(
-            prompt,
-            generation_config={"temperature": 0.1, "max_output_tokens": 500},
-        )
-        parsed = _extract_json_object(getattr(response, "text", "") or "")
+        response_text = ollama_generate(prompt, enforce_json=True)
+        parsed = _extract_json_object(response_text)
         if not parsed:
             return ""
         return _normalize_whitespace(parsed.get("summary", ""))
     except Exception as e:
-        error_text = str(e)
-        if "API_KEY_INVALID" in error_text or "API key not valid" in error_text:
-            if _GEMINI_DISABLED_REASON != "invalid_key":
-                print("Gemini disabled: GEMINI_API_KEY was rejected by the API.")
-                _GEMINI_DISABLED_REASON = "invalid_key"
-            return ""
-        print("Gemini summary failed:", e)
+        print("Local summary failed:", e)
         return ""
 
 
-def gemini_analysis(transcript, fallback_intents):
+def local_analysis(transcript, fallback_intents):
     """
     Returns:
     {
@@ -638,19 +514,11 @@ def gemini_analysis(transcript, fallback_intents):
       "intents": [str]
     }
     """
-    global _GEMINI_DISABLED_REASON
-
-    api_key = _get_gemini_api_key()
-    if not api_key or not transcript.strip():
+    if not transcript.strip():
         return None
 
-    genai = _import_gemini_sdk("analysis")
-    if genai is None:
-        return None
-
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     prompt = f"""
-You are an expert call transcript analyst. I need highly accurate insights from the following transcript.
+You are an expert call transcript analyst. I need highly accurate and professional insights from the following transcript.
 Analyze the transcript and return your response ONLY as a valid JSON object matching this exact schema:
 
 {{
@@ -663,26 +531,19 @@ Analyze the transcript and return your response ONLY as a valid JSON object matc
 }}
 
 Detailed Requirements:
-1. "summary": Provide a clear, cohesive, and comprehensive paragraph (around 4-6 sentences) summarizing the call. Cover the reason for the call, key discussion points, customer issues/concerns, the agent's resolution, and any required next steps. Do not use restrictive headings like 'Call Purpose:'—write an effective executive summary.
-2. "sentiment": Evaluate the overall tone of the customer. Must be exactly one of: "positive", "neutral", or "negative".
-3. "sentiment_confidence": A decimal between 0.0 and 1.0 indicating how confident you are in the sentiment.
-4. "sentiment_reason": One concise sentence explaining why you chose this sentiment, citing specific customer reactions or outcomes.
+1. "summary": Provide a highly accurate, professional summary of the call. Structure the summary to clearly reflect the two-way nature of the conversation—highlighting the back-and-forth dialogue, what the Customer expressed/requested, and exactly how the Agent responded and resolved the situation. Ensure all critical context is captured in a cohesive narrative.
+2. "sentiment": Evaluate the overall tone of the customer with high accuracy. Must be exactly one of: "positive", "neutral", or "negative". Focus strictly on the customer's disposition throughout the interaction.
+3. "sentiment_confidence": A decimal between 0.0 and 1.0 indicating how confident you are in the sentiment. Be mathematically precise.
+4. "sentiment_reason": One concise sentence accurately explaining why you chose this sentiment, citing specific customer phrasing, reactions, or final outcome.
 5. "emotion": The primary emotion displayed by the customer (e.g., "frustrated", "satisfied", "confused", "appreciative", "urgent").
-6. "intents": 2-5 short tags capturing the topics of the conversation (e.g., "billing_issue", "product_inquiry", "cancellation").
+6. "intents": 2-5 short tags accurately capturing the topics of the conversation (e.g., "billing_issue", "product_inquiry", "cancellation").
 
 Transcript:
 {transcript}
 """
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(model_name)
-        response = model.generate_content(
-            prompt,
-            generation_config={"temperature": 0.2, "max_output_tokens": 700},
-        )
-
-        text = getattr(response, "text", "") or ""
-        parsed = _extract_json_object(text)
+        response_text = ollama_generate(prompt, enforce_json=True)
+        parsed = _extract_json_object(response_text)
         if not parsed:
             return None
 
@@ -714,13 +575,7 @@ Transcript:
             "intents": intents,
         }
     except Exception as e:
-        error_text = str(e)
-        if "API_KEY_INVALID" in error_text or "API key not valid" in error_text:
-            if _GEMINI_DISABLED_REASON != "invalid_key":
-                print("Gemini disabled: GEMINI_API_KEY was rejected by the API.")
-                _GEMINI_DISABLED_REASON = "invalid_key"
-            return None
-        print("Gemini analysis failed:", e)
+        print("Local analysis failed:", e)
         return None
 
 
@@ -731,9 +586,9 @@ def process_uploaded_audio(audio_path):
     filename = os.path.basename(audio_path)
     base = os.path.splitext(filename)[0]
 
-    gemini_text = _normalize_whitespace(transcribe_file_gemini(audio_path))
-    raw_transcript = gemini_text
-    transcript_provider = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash") if gemini_text else "none"
+    local_text = _normalize_whitespace(transcribe_file_local(audio_path))
+    raw_transcript = local_text
+    transcript_provider = "faster-whisper" if local_text else "none"
 
     transcript = raw_transcript
     refined_transcript = ""
@@ -751,7 +606,7 @@ def process_uploaded_audio(audio_path):
             should_refine = False
 
         if should_refine:
-            refined_transcript = gemini_refine_transcript(raw_transcript, "")
+            refined_transcript = local_refine_transcript(raw_transcript, "")
             if refined_transcript:
                 transcript = refined_transcript
                 transcript_refined = True
@@ -760,15 +615,15 @@ def process_uploaded_audio(audio_path):
 
     normalized = normalize_language(transcript)
     fallback_intents = detect_intents(normalized)
-    gemini_result = gemini_analysis(transcript, fallback_intents)
-    if gemini_result:
-        summary = gemini_result.get("summary") or ""
-        sentiment = gemini_result["sentiment"]
-        sentiment_confidence = gemini_result["sentiment_confidence"]
-        sentiment_reason = gemini_result.get("sentiment_reason") or ""
-        intents = gemini_result["intents"]
-        emotion = gemini_result["emotion"] or "neutral"
-        analysis_provider = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    local_result = local_analysis(transcript, fallback_intents)
+    if local_result:
+        summary = local_result.get("summary") or ""
+        sentiment = local_result["sentiment"]
+        sentiment_confidence = local_result["sentiment_confidence"]
+        sentiment_reason = local_result.get("sentiment_reason") or ""
+        intents = local_result["intents"]
+        emotion = local_result["emotion"] or "neutral"
+        analysis_provider = OLLAMA_MODEL
     else:
         summary = generate_local_summary(transcript)
         sentiment = analyze_sentiment(transcript)
@@ -812,7 +667,7 @@ def process_uploaded_audio(audio_path):
         "transcript_provider": transcript_provider,
         "transcript_refined": transcript_refined,
         "transcript_refiner": (
-            os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+            OLLAMA_MODEL
             if transcript_refined
             else ""
         ),

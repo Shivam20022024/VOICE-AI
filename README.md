@@ -22,3 +22,31 @@ Prerequisites: Node.js and Python 3.11+
    `npm run dev`
 
 If the backend is started with system Python instead of `backend\venv\Scripts\python.exe`, optional Gemini features may be unavailable unless those packages are also installed globally.
+
+
+
+
+
+# Voice AI Project
+
+## Features
+- AI Voice Interaction
+- Backend API (Python)
+- Frontend (React + Vite)
+
+## Tech Stack
+- Python
+- FastAPI / Flask
+- React
+- Vite
+
+## Setup
+# Backend
+cd backend
+pip install -r requirements.txt
+python server.py
+
+# Frontend
+cd frontend
+npm install
+npm run dev

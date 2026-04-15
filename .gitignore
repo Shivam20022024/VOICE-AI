@@ -1,10 +1,19 @@
-backend/venv/
-backend/__pycache__/
-backend/temp_*.wav
-backend/temp_*.mp3
-backend/temp_*.m4a
-backend/temp_*.mpeg
+# Python
+__pycache__/
+*.pyc
+*.db
+
+# Env
+.env
+
+# Backend temp files
+backend/temp_*
 backend/results/
-Fortend/node_modules/
-Fortend/build/
-Fortend/.next/
+
+# Frontend
+frontend/node_modules/
+frontend/build/
+frontend/.next/
+
+# General
+.DS_Store
